@@ -329,6 +329,30 @@ jobs:
         python3 -c "from urllib.request import urlretrieve; urlretrieve('${{ env.BUILDER_HOST }}/${{ env.BUILDER_SOURCE }}/${{ env.BUILDER_VERSION }}/builder.pyz?run=${{ env.RUN }}', 'builder')"
         chmod a+x builder
         ./builder build -p ${{ env.PACKAGE_NAME }} --spec=downstream
+    - name: Debug s2n feature probes
+      if: always()
+      run: |
+        echo "=== Architecture check ==="
+        LIBCRYPTO=$(find . -name "libcrypto.a" -path "*/AWSLC/*" | head -1)
+        echo "libcrypto.a path: $LIBCRYPTO"
+        file "$LIBCRYPTO"
+        lipo -info "$LIBCRYPTO" 2>/dev/null || true
+        echo ""
+        echo "=== aws-lc version ==="
+        git -C aws-crt-cpp/crt/aws-lc log --oneline -1
+        echo ""
+        echo "=== Probe results ==="
+        AWSLC_INC=aws-crt-cpp/crt/aws-lc/include
+        S2N_DIR=aws-crt-cpp/crt/s2n
+        for probe in $S2N_DIR/tests/features/S2N_LIBCRYPTO_*.c; do
+          name=$(basename $probe .c)
+          output=$(cc -Werror-implicit-function-declaration -Wno-unused-variable \
+            -I "$AWSLC_INC" -I "$S2N_DIR" -include "$S2N_DIR/utils/s2n_prelude.h" \
+            "$probe" "$LIBCRYPTO" -o /tmp/probe_out 2>&1)
+          if [ $? -eq 0 ]; then echo "PASS: $name"
+          else echo "FAIL: $name"; echo "  $output" | head -3
+          fi
+        done
 
   macos-x64-s2n:
     runs-on: macos-14-large # latest
@@ -344,6 +368,30 @@ jobs:
         python3 -c "from urllib.request import urlretrieve; urlretrieve('${{ env.BUILDER_HOST }}/${{ env.BUILDER_SOURCE }}/${{ env.BUILDER_VERSION }}/builder.pyz?run=${{ env.RUN }}', 'builder')"
         chmod a+x builder
         ./builder build -p ${{ env.PACKAGE_NAME }} --spec=downstream
+    - name: Debug s2n feature probes
+      if: always()
+      run: |
+        echo "=== Architecture check ==="
+        LIBCRYPTO=$(find . -name "libcrypto.a" -path "*/AWSLC/*" | head -1)
+        echo "libcrypto.a path: $LIBCRYPTO"
+        file "$LIBCRYPTO"
+        lipo -info "$LIBCRYPTO" 2>/dev/null || true
+        echo ""
+        echo "=== aws-lc version ==="
+        git -C aws-crt-cpp/crt/aws-lc log --oneline -1
+        echo ""
+        echo "=== Probe results ==="
+        AWSLC_INC=aws-crt-cpp/crt/aws-lc/include
+        S2N_DIR=aws-crt-cpp/crt/s2n
+        for probe in $S2N_DIR/tests/features/S2N_LIBCRYPTO_*.c; do
+          name=$(basename $probe .c)
+          output=$(cc -Werror-implicit-function-declaration -Wno-unused-variable \
+            -I "$AWSLC_INC" -I "$S2N_DIR" -include "$S2N_DIR/utils/s2n_prelude.h" \
+            "$probe" "$LIBCRYPTO" -o /tmp/probe_out 2>&1)
+          if [ $? -eq 0 ]; then echo "PASS: $name"
+          else echo "FAIL: $name"; echo "  $output" | head -3
+          fi
+        done
 
   macos-s2n-openssl:
     runs-on: macos-14 # latest
