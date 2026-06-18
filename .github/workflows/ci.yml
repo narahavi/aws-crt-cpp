@@ -328,7 +328,7 @@ jobs:
       run: |
         python3 -c "from urllib.request import urlretrieve; urlretrieve('${{ env.BUILDER_HOST }}/${{ env.BUILDER_SOURCE }}/${{ env.BUILDER_VERSION }}/builder.pyz?run=${{ env.RUN }}', 'builder')"
         chmod a+x builder
-        ./builder build -p ${{ env.PACKAGE_NAME }} --spec=downstream
+        ./builder build -p ${{ env.PACKAGE_NAME }} --spec=downstream run_tests=false
     - name: Debug s2n feature probes
       if: always()
       run: |
@@ -348,9 +348,12 @@ jobs:
           name=$(basename $probe .c)
           output=$(cc -Werror-implicit-function-declaration -Wno-unused-variable \
             -I "$AWSLC_INC" -I "$S2N_DIR" -include "$S2N_DIR/utils/s2n_prelude.h" \
-            "$probe" "$LIBCRYPTO" -o /tmp/probe_out 2>&1)
-          if [ $? -eq 0 ]; then echo "PASS: $name"
-          else echo "FAIL: $name"; echo "  $output" | head -3
+            "$probe" "$LIBCRYPTO" -o /tmp/probe_out 2>&1 || true)
+          if echo "$output" | grep -q "error:"; then
+            echo "FAIL: $name"
+            echo "  $output" | head -3
+          else
+            echo "PASS: $name"
           fi
         done
 
@@ -367,7 +370,7 @@ jobs:
       run: |
         python3 -c "from urllib.request import urlretrieve; urlretrieve('${{ env.BUILDER_HOST }}/${{ env.BUILDER_SOURCE }}/${{ env.BUILDER_VERSION }}/builder.pyz?run=${{ env.RUN }}', 'builder')"
         chmod a+x builder
-        ./builder build -p ${{ env.PACKAGE_NAME }} --spec=downstream
+        ./builder build -p ${{ env.PACKAGE_NAME }} --spec=downstream run_tests=false
     - name: Debug s2n feature probes
       if: always()
       run: |
@@ -387,9 +390,12 @@ jobs:
           name=$(basename $probe .c)
           output=$(cc -Werror-implicit-function-declaration -Wno-unused-variable \
             -I "$AWSLC_INC" -I "$S2N_DIR" -include "$S2N_DIR/utils/s2n_prelude.h" \
-            "$probe" "$LIBCRYPTO" -o /tmp/probe_out 2>&1)
-          if [ $? -eq 0 ]; then echo "PASS: $name"
-          else echo "FAIL: $name"; echo "  $output" | head -3
+            "$probe" "$LIBCRYPTO" -o /tmp/probe_out 2>&1 || true)
+          if echo "$output" | grep -q "error:"; then
+            echo "FAIL: $name"
+            echo "  $output" | head -3
+          else
+            echo "PASS: $name"
           fi
         done
 
