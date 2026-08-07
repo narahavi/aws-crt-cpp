@@ -1136,6 +1136,25 @@ namespace Aws
                     const std::shared_ptr<Http::HttpRequest> &request,
                     const Crt::String &operationName) noexcept;
 
+                /**
+                 * Build options for a S3MetaRequestType::Default meta request
+                 * whose response body is delivered through a caller-owned
+                 * BodyCallback. Needed for operations that return a body worth
+                 * reading (ex. ListObjectsV2, whose object listing arrives as an
+                 * XML body); the operationName-only overload leaves no body sink,
+                 * so the response body would be discarded.
+                 *
+                 * @param request the prepared HTTP request.
+                 * @param operationName the S3 API operation name
+                 *        (ex. "ListObjectsV2").
+                 * @param cb the body callback to invoke for each chunk.
+                 * @return a unique_ptr to the base type, or nullptr on failure.
+                 */
+                static ScopedResource<S3MetaRequestOptions> Create(
+                    const std::shared_ptr<Http::HttpRequest> &request,
+                    const Crt::String &operationName,
+                    BodyCallback cb) noexcept;
+
                 /// @private Prefer the Create factory.
                 S3DefaultObjectMetaRequestOptions(
                     const std::shared_ptr<Http::HttpRequest> &request,
@@ -1324,6 +1343,124 @@ namespace Aws
                 ScopedResource<struct aws_s3_meta_request> m_metaRequest;
                 int m_lastError;
             };
+
+            // TODO(mentor review): the directory-traversal binding below wraps
+            // aws-c-common's aws_directory_traverse (a filesystem API), not
+            // anything from aws-c-s3. It lives here so directory upload has a
+            // C++-side walker with follow-symlink + cycle-detection semantics the
+            // C API does not provide, keeping s3-transfer free of direct C calls.
+            // It is unrelated to the S3 meta-request types above; should it live
+            // in its own header pair (ex. aws/crt/io/DirectoryTraversal.h +
+            // source/io/DirectoryTraversal.cpp) rather than in the S3 binding?
+
+            /**
+             * The kind of filesystem entry reported by a directory traversal.
+             * Bit-flags: an entry may carry more than one bit (ex. a symbolic
+             * link to a directory is SymLink only - see DirectoryEntry).
+             */
+            enum class DirectoryEntryType
+            {
+                None = 0,
+                File = 1,      // AWS_FILE_TYPE_FILE
+                SymLink = 2,   // AWS_FILE_TYPE_SYM_LINK
+                Directory = 4, // AWS_FILE_TYPE_DIRECTORY
+            };
+
+            /**
+             * A single entry produced during a directory traversal. Mirrors
+             * aws_directory_entry, but owns copies of the paths so it remains
+             * valid after the underlying C callback returns.
+             *
+             * Note on symbolic links: the underlying lstat-based traversal never
+             * follows links, so a symlink pointing at a directory is reported with
+             * the SymLink bit set but NOT the Directory bit. When traversal is
+             * configured to follow symbolic links, the link target's entries are
+             * delivered as ordinary File/Directory entries during the recursion
+             * into the target.
+             */
+            struct AWS_CRT_CPP_API DirectoryEntry
+            {
+                // Absolute, canonicalized (realpath) path to the entry. Empty if
+                // the path could not be resolved.
+                String path;
+                // Path to the entry relative to the traversal root.
+                String relativePath;
+                // Bit-field of DirectoryEntryType values.
+                int fileType = 0;
+                // Size of the file on disk in bytes; only meaningful for regular
+                // files (the File bit is set).
+                int64_t fileSize = 0;
+
+                bool IsFile() const noexcept
+                {
+                    return (fileType & static_cast<int>(DirectoryEntryType::File)) != 0;
+                }
+                bool IsSymLink() const noexcept
+                {
+                    return (fileType & static_cast<int>(DirectoryEntryType::SymLink)) != 0;
+                }
+                bool IsDirectory() const noexcept
+                {
+                    return (fileType & static_cast<int>(DirectoryEntryType::Directory)) != 0;
+                }
+            };
+
+            /**
+             * Options controlling a directory traversal.
+             */
+            struct AWS_CRT_CPP_API DirectoryTraversalOptions
+            {
+                // When true, symbolic links that resolve to directories are
+                // followed and their contents traversed; a link that would
+                // re-enter an ancestor directory (a cycle) aborts the traversal
+                // with AWS_ERROR_FILE_INVALID_PATH. When false (the default), a
+                // symlink-to-directory is reported as a leaf SymLink entry and not
+                // descended into. Symlinks to regular files are always reported as
+                // SymLink entries regardless of this setting; the caller decides
+                // whether to treat them as uploadable files.
+                bool followSymbolicLinks = false;
+
+                // Maximum directory depth to descend, where the entries directly
+                // inside the root are at depth 1. 0 means unlimited. Entries below
+                // the limit are not reported.
+                uint32_t maxDepth = 0;
+            };
+
+            /**
+             * Invoked once per filesystem entry during a traversal.
+             * @param entry the entry encountered.
+             * @return true to continue the traversal, false to abort it early
+             *         (TraverseDirectory then returns AWS_OP_SUCCESS).
+             */
+            using DirectoryEntryCallback = std::function<bool(const DirectoryEntry &entry)>;
+
+            /**
+             * Recursively traverse the directory rooted at path, invoking onEntry
+             * for each entry encountered.
+             *
+             * This wraps aws-c-common's aws_directory_traverse but adds two
+             * behaviors the C API lacks: bounded depth (maxDepth) and optional
+             * following of symbolic links with cycle detection. The C traversal is
+             * lstat-based and never follows links, so following is implemented here
+             * by descending into link targets manually while tracking the chain of
+             * canonical ancestor paths; a link resolving to an ancestor is a cycle
+             * and fails the traversal rather than looping forever.
+             *
+             * Traversal order matches the C API: post-order, depth-first (children
+             * before their containing directory) when recursing.
+             *
+             * @param path the root directory to traverse.
+             * @param options traversal options (follow-symlinks, max depth).
+             * @param onEntry callback invoked per entry; return false to abort.
+             * @return AWS_OP_SUCCESS (0) on success (including a caller-requested
+             *         early abort), otherwise a CRT error code. On failure,
+             *         aws_last_error() holds the error. A detected symlink cycle
+             *         fails with AWS_ERROR_FILE_INVALID_PATH.
+             */
+            AWS_CRT_CPP_API int TraverseDirectory(
+                const String &path,
+                const DirectoryTraversalOptions &options,
+                const DirectoryEntryCallback &onEntry) noexcept;
 
         } // namespace S3
     } // namespace Crt

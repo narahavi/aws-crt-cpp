@@ -10,6 +10,8 @@
 #include <aws/crt/io/EventLoopGroup.h>
 
 #include <aws/auth/signing_config.h>
+#include <aws/common/file.h>
+#include <aws/common/string.h>
 #include <aws/http/connection.h>
 #include <aws/http/proxy.h>
 #include <aws/http/request_response.h>
@@ -700,6 +702,22 @@ namespace Aws
                 return s_makeOptions<S3DefaultObjectMetaRequestOptions>(request, operationName);
             }
 
+            ScopedResource<S3MetaRequestOptions> S3DefaultObjectMetaRequestOptions::Create(
+                const std::shared_ptr<Http::HttpRequest> &request,
+                const Crt::String &operationName,
+                BodyCallback cb) noexcept
+            {
+                auto opts = s_makeOptions<S3DefaultObjectMetaRequestOptions>(request, operationName);
+                if (opts)
+                {
+                    // Reach m_bodyCb (protected on the base) through the concrete
+                    // subclass pointer, mirroring the GetObject body-callback
+                    // factory; a base-class pointer cannot access it here.
+                    static_cast<S3DefaultObjectMetaRequestOptions *>(opts.get())->m_bodyCb = std::move(cb);
+                }
+                return opts;
+            }
+
             struct S3MetaRequestCallbackData
             {
                 std::shared_ptr<S3MetaRequest> wrapper;
@@ -1150,6 +1168,255 @@ namespace Aws
             int S3MetaRequest::LastError() const noexcept
             {
                 return m_lastError ? m_lastError : AWS_ERROR_UNKNOWN;
+            }
+
+            /*****************************************************
+             *
+             * Directory traversal (wraps aws_directory_traverse)
+             *
+             *****************************************************/
+            namespace
+            {
+                // Copy a byte cursor into an owned String, tolerating a null/empty
+                // cursor (ex. entry.path when realpath could not resolve).
+                String s_cursorToString(const ByteCursor &cursor) noexcept
+                {
+                    if (cursor.ptr == nullptr || cursor.len == 0)
+                    {
+                        return String();
+                    }
+                    return String(reinterpret_cast<const char *>(cursor.ptr), cursor.len);
+                }
+
+                // true if canonicalPath names an existing directory. Given the
+                // resolved (realpath) target of a symlink, this distinguishes a
+                // symlink-to-directory (descend) from a symlink-to-file (upload).
+                bool s_isExistingDirectory(const String &canonicalPath) noexcept
+                {
+                    if (canonicalPath.empty())
+                    {
+                        return false;
+                    }
+                    struct aws_string *pathStr = aws_string_new_from_c_str(ApiAllocator(), canonicalPath.c_str());
+                    if (pathStr == nullptr)
+                    {
+                        return false;
+                    }
+                    const bool exists = aws_directory_exists(pathStr);
+                    aws_string_destroy(pathStr);
+                    return exists;
+                }
+
+                // Best-effort byte length of the file at canonicalPath; 0 if it
+                // cannot be opened or measured. Used to fill fileSize for a
+                // followed symlink-to-file (the C traversal only sets file_size
+                // for entries lstat reports as regular files, never for symlinks).
+                int64_t s_bestEffortFileLength(const String &canonicalPath) noexcept
+                {
+                    if (canonicalPath.empty())
+                    {
+                        return 0;
+                    }
+                    struct aws_string *pathStr = aws_string_new_from_c_str(ApiAllocator(), canonicalPath.c_str());
+                    if (pathStr == nullptr)
+                    {
+                        return 0;
+                    }
+                    struct aws_string *mode = aws_string_new_from_c_str(ApiAllocator(), "rb");
+                    int64_t length = 0;
+                    if (mode != nullptr)
+                    {
+                        FILE *file = aws_fopen_safe(pathStr, mode);
+                        if (file != nullptr)
+                        {
+                            if (aws_file_get_length(file, &length) != AWS_OP_SUCCESS)
+                            {
+                                length = 0;
+                            }
+                            fclose(file);
+                        }
+                        aws_string_destroy(mode);
+                    }
+                    aws_string_destroy(pathStr);
+                    return length < 0 ? 0 : length;
+                }
+
+                // Mutable state threaded through the recursive descent.
+                struct DirTraversalState
+                {
+                    const DirectoryTraversalOptions *options = nullptr;
+                    const DirectoryEntryCallback *onEntry = nullptr;
+                    // Canonical (realpath) paths of directories currently on the
+                    // descent path. A cycle re-enters one of these; the stack is
+                    // small (one entry per depth level), so linear search is fine.
+                    Vector<String> ancestors;
+                    bool aborted = false;
+                    int errorCode = AWS_ERROR_SUCCESS;
+                };
+
+                // aws_on_directory_entry callback: collect immediate children of
+                // the level being listed. Always returns true (collect all, then
+                // recurse in C++), so aws_directory_traverse never sees an abort
+                // and only fails on a real I/O error.
+                bool s_collectChild(const struct aws_directory_entry *entry, void *userData) noexcept
+                {
+                    auto *children = static_cast<Vector<DirectoryEntry> *>(userData);
+                    DirectoryEntry out;
+                    out.path = s_cursorToString(entry->path);
+                    out.relativePath = s_cursorToString(entry->relative_path);
+                    out.fileType = entry->file_type;
+                    out.fileSize = entry->file_size;
+                    children->push_back(std::move(out));
+                    return true;
+                }
+
+                void s_traverseLevel(const String &listPath, uint32_t depth, DirTraversalState &state) noexcept
+                {
+                    Allocator *allocator = ApiAllocator();
+                    struct aws_string *listPathStr = aws_string_new_from_c_str(allocator, listPath.c_str());
+                    if (listPathStr == nullptr)
+                    {
+                        state.errorCode = aws_last_error();
+                        return;
+                    }
+
+                    // recursive=false: list only this level; we drive descent
+                    // ourselves to enforce maxDepth and follow-symlink semantics.
+                    Vector<DirectoryEntry> children;
+                    const int rc = aws_directory_traverse(allocator, listPathStr, false, s_collectChild, &children);
+                    aws_string_destroy(listPathStr);
+                    if (rc != AWS_OP_SUCCESS)
+                    {
+                        state.errorCode = aws_last_error();
+                        return;
+                    }
+
+                    const DirectoryTraversalOptions &options = *state.options;
+                    for (auto &child : children)
+                    {
+                        if (state.aborted || state.errorCode != AWS_ERROR_SUCCESS)
+                        {
+                            return;
+                        }
+
+                        const bool isDir = child.IsDirectory();
+                        const bool isLink = child.IsSymLink();
+                        bool descend = false;
+
+                        if (isDir && !isLink)
+                        {
+                            descend = (options.maxDepth == 0 || depth < options.maxDepth);
+                        }
+                        else if (isLink && options.followSymbolicLinks && !child.path.empty())
+                        {
+                            if (s_isExistingDirectory(child.path))
+                            {
+                                // Symlink to a directory: mark it so the caller can
+                                // tell (it is not an uploadable object) and descend
+                                // into the target.
+                                child.fileType |= static_cast<int>(DirectoryEntryType::Directory);
+                                descend = (options.maxDepth == 0 || depth < options.maxDepth);
+                            }
+                            else
+                            {
+                                // Symlink to a regular file: surface it as a file so
+                                // the caller treats it uniformly (uploads the target)
+                                // without needing its own filesystem probe.
+                                child.fileType |= static_cast<int>(DirectoryEntryType::File);
+                                child.fileSize = s_bestEffortFileLength(child.path);
+                            }
+                        }
+
+                        if (descend)
+                        {
+                            const String &canonical = child.path;
+                            bool pushed = false;
+                            if (!canonical.empty())
+                            {
+                                for (const auto &ancestor : state.ancestors)
+                                {
+                                    if (ancestor == canonical)
+                                    {
+                                        // Circular symbolic link: fail the traversal
+                                        // (the SEP requires detecting these).
+                                        state.errorCode = AWS_ERROR_FILE_INVALID_PATH;
+                                        aws_raise_error(AWS_ERROR_FILE_INVALID_PATH);
+                                        return;
+                                    }
+                                }
+                                state.ancestors.push_back(canonical);
+                                pushed = true;
+                            }
+
+                            // Recurse via the relative path (not the canonical
+                            // target): opendir follows the link at the OS level, so
+                            // the target's children come back with relative_paths
+                            // rebased on the traversal root - exactly what S3 key
+                            // derivation needs.
+                            s_traverseLevel(child.relativePath, depth + 1, state);
+
+                            if (pushed)
+                            {
+                                state.ancestors.pop_back();
+                            }
+                            if (state.aborted || state.errorCode != AWS_ERROR_SUCCESS)
+                            {
+                                return;
+                            }
+                        }
+
+                        // Post-order (children before their containing directory),
+                        // matching aws_directory_traverse's recursive contract.
+                        if (!(*state.onEntry)(child))
+                        {
+                            state.aborted = true;
+                            return;
+                        }
+                    }
+                }
+            } // namespace
+
+            int TraverseDirectory(
+                const String &path,
+                const DirectoryTraversalOptions &options,
+                const DirectoryEntryCallback &onEntry) noexcept
+            {
+                if (!onEntry)
+                {
+                    aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+                    return AWS_ERROR_INVALID_ARGUMENT;
+                }
+
+                // Strip trailing separators so listing and relative-path building
+                // are consistent (aws_directory_traverse also trims one, but a
+                // path like "dir//" or a Windows "dir\\" is normalized here first).
+                String root = path;
+                while (!root.empty() && aws_is_any_directory_separator(root.back()))
+                {
+                    root.pop_back();
+                }
+                if (root.empty())
+                {
+                    // The path was only separators (ex. "/"); traverse it as given.
+                    root = path;
+                }
+
+                DirTraversalState state;
+                state.options = &options;
+                state.onEntry = &onEntry;
+
+                // Root's children are at depth 1. No need to seed the ancestor set
+                // with the root's canonical path: any cycle back to the root must
+                // pass through a followed symlink whose canonical path we push on
+                // descent, so it is caught (at worst one extra level down) rather
+                // than looping - the traversal always terminates.
+                s_traverseLevel(root, 1, state);
+
+                if (state.errorCode != AWS_ERROR_SUCCESS)
+                {
+                    return state.errorCode;
+                }
+                return AWS_OP_SUCCESS;
             }
 
         } // namespace S3
